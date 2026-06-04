@@ -77,6 +77,94 @@ if trigger in src and "filename_list_cache" not in src:
 PYEOF
 fi
 
+# --- Stage curated custom nodes from the network volume (ALLOWLIST ONLY) ---
+# Promote nodes from the persistent pod to serverless without a blanket sync.
+# Two opt-in sources, both honored; the pod's full custom_nodes dir is NEVER
+# blanket-linked. Baked image nodes are never clobbered. Removing a node from
+# the folder/manifest un-stages it on the next cold worker (/ComfyUI is
+# ephemeral per worker). Normal published nodes still come via Manager-registry
+# auto-install below; this is for pinned/unpublished/promoted nodes.
+#   1) snapshot folder:  $VOLUME_ROOT/ComfyUI/custom_nodes_serverless/<node>/
+#   2) manifest:         $VOLUME_ROOT/ComfyUI/serverless_custom_nodes.json
+#        {"nodes": ["NodeA", {"name": "NodeB", "commit": "<sha>"}]}
+#      names resolve from the snapshot folder first, else the pod tree.
+VOLUME_ROOT="$(dirname "$RUNTIME_DIR")"
+STAGE_DIR="$VOLUME_ROOT/ComfyUI/custom_nodes_serverless"
+STAGE_MANIFEST="$VOLUME_ROOT/ComfyUI/serverless_custom_nodes.json"
+POD_NODES="$VOLUME_ROOT/runpod-slim/ComfyUI/custom_nodes"
+TARGET_NODES="$COMFYUI_DIR/custom_nodes"
+STAGED_LINKED=0; STAGED_SKIPPED=0; STAGED_MISSING=0
+
+stage_one() {  # $1=node name  $2=pinned commit (optional)
+    local name="$1" pin="${2:-}" src="" sha=""
+    if   [ -d "$STAGE_DIR/$name" ]; then src="$STAGE_DIR/$name"
+    elif [ -d "$POD_NODES/$name" ]; then src="$POD_NODES/$name"
+    else
+        echo "[stage] MISSING $name (looked in $STAGE_DIR and $POD_NODES)"
+        STAGED_MISSING=$((STAGED_MISSING+1)); return 0
+    fi
+    if [ -e "$TARGET_NODES/$name" ] && [ ! -L "$TARGET_NODES/$name" ]; then
+        echo "[stage] SKIP (baked in image) $name"
+        STAGED_SKIPPED=$((STAGED_SKIPPED+1)); return 0
+    fi
+    if [ -n "$pin" ]; then
+        if git -C "$src" cat-file -e "${pin}^{commit}" 2>/dev/null; then
+            git -C "$src" checkout -q "$pin" 2>/dev/null || true
+        else
+            echo "[stage] SKIP $name — pinned commit $pin not found in $src"
+            STAGED_SKIPPED=$((STAGED_SKIPPED+1)); return 0
+        fi
+    fi
+    sha="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+    ln -sfn "$src" "$TARGET_NODES/$name"
+    echo "[stage] LINKED $name -> $src @ $sha${pin:+ (pinned $pin)}"
+    STAGED_LINKED=$((STAGED_LINKED+1))
+    if [ -f "$src/requirements.txt" ]; then
+        pip install -q -r "$src/requirements.txt" 2>/dev/null \
+            && echo "[stage]   deps installed for $name" \
+            || echo "[stage]   WARNING deps install failed for $name"
+    fi
+}
+
+if [ -d "$STAGE_DIR" ] || [ -f "$STAGE_MANIFEST" ]; then
+    mkdir -p "$TARGET_NODES"
+    echo "[stage] Staging curated serverless custom nodes (allowlist)..."
+    if [ -d "$STAGE_DIR" ]; then
+        for d in "$STAGE_DIR"/*/; do
+            [ -d "$d" ] || continue
+            stage_one "$(basename "$d")" ""
+        done
+    fi
+    if [ -f "$STAGE_MANIFEST" ]; then
+        MANIFEST_LINES="$(python3 - "$STAGE_MANIFEST" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("__PARSE_ERROR__\t%s" % e); sys.exit(0)
+nodes = d.get("nodes", []) if isinstance(d, dict) else d
+if not isinstance(nodes, list): nodes = []
+for n in nodes:
+    if isinstance(n, str):
+        if n.strip(): print("%s\t" % n.strip())
+    elif isinstance(n, dict) and n.get("name"):
+        print("%s\t%s" % (n["name"].strip(), (n.get("commit") or "").strip()))
+PYEOF
+)"
+        while IFS=$'\t' read -r mname mcommit; do
+            [ -z "$mname" ] && continue
+            if [ "$mname" = "__PARSE_ERROR__" ]; then
+                echo "[stage] WARNING manifest parse error: $mcommit (ignoring manifest)"; continue
+            fi
+            [ -L "$TARGET_NODES/$mname" ] && continue   # already linked via snapshot folder
+            stage_one "$mname" "$mcommit"
+        done <<< "$MANIFEST_LINES"
+    fi
+    echo "[stage] Summary: linked=$STAGED_LINKED skipped=$STAGED_SKIPPED missing=$STAGED_MISSING"
+else
+    echo "[stage] No serverless node staging configured ($STAGE_DIR / $STAGE_MANIFEST absent)"
+fi
+
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
 # Experimental performance flags (enable via EXPERIMENTAL=true env var)
