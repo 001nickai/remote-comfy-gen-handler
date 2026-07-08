@@ -126,7 +126,7 @@ stage_one() {  # $1=node name  $2=pinned commit (optional)
     fi
 }
 
-if [ -d "$STAGE_DIR" ] || [ -f "$STAGE_MANIFEST" ]; then
+if [ -d "$STAGE_DIR" ] || [ -f "$STAGE_MANIFEST" ] || [ -n "${SERVERLESS_EXTRA_NODES:-}" ]; then
     mkdir -p "$TARGET_NODES"
     echo "[stage] Staging curated serverless custom nodes (allowlist)..."
     if [ -d "$STAGE_DIR" ]; then
@@ -160,9 +160,43 @@ PYEOF
             stage_one "$mname" "$mcommit"
         done <<< "$MANIFEST_LINES"
     fi
+    #   3) env allowlist: space-separated node names, set per-endpoint in the RunPod
+    #      template (SERVERLESS_EXTRA_NODES). Keeps staging endpoint-scoped — the voice
+    #      endpoint stages Qwen-TTS without touching the image endpoint's cold starts.
+    for en in ${SERVERLESS_EXTRA_NODES:-}; do
+        [ -L "$TARGET_NODES/$en" ] && continue   # already linked via folder/manifest
+        stage_one "$en" ""
+    done
     echo "[stage] Summary: linked=$STAGED_LINKED skipped=$STAGED_SKIPPED missing=$STAGED_MISSING"
 else
     echo "[stage] No serverless node staging configured ($STAGE_DIR / $STAGE_MANIFEST absent)"
+fi
+
+# --- Qwen-TTS lane extras (only when SERVERLESS_EXTRA_NODES is set) ---
+# The Qwen-TTS node reads/writes models via the BASE models dir (ephemeral in the image),
+# not extra_model_paths: link its model home to the volume so the ~9GB of TTS models are
+# not re-downloaded per cold worker and SaveVoice speakers persist to the shared volume.
+if [ -n "${SERVERLESS_EXTRA_NODES:-}" ]; then
+    for QROOT in "$VOLUME_ROOT/ComfyUI/models/qwen-tts" "$VOLUME_ROOT/runpod-slim/ComfyUI/models/qwen-tts"; do
+        if [ -d "$QROOT" ]; then
+            mkdir -p "$COMFYUI_DIR/models"
+            ln -sfn "$QROOT" "$COMFYUI_DIR/models/qwen-tts"
+            echo "[stage] qwen-tts models linked -> $QROOT"
+            break
+        fi
+    done
+    # The baked venv can carry a placeholder accelerate==0.0.1 (empty stub) that satisfies
+    # pip but fails transformers' is_accelerate_available() at model load (burned on the
+    # pod 2026-07-08) — force a real accelerate if needed.
+    python3 - <<'PYEOF' || pip install -q --no-cache-dir "accelerate>=1.0"
+import sys
+try:
+    import accelerate
+    ok = tuple(int(x) for x in accelerate.__version__.split(".")[:2]) >= (1, 0)
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PYEOF
 fi
 
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
