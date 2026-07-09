@@ -970,7 +970,7 @@ def handler(job: dict) -> dict:
             primary_path = results["images"][0]["path"]
         elif output_audio:
             primary = output_audio[0]
-            primary_path = results["audio"][0]["path"]
+            # no primary_path: _read_dimensions misparses audio bytes as JPEG (garbage w/h)
 
         output = {"url": primary["url"] if primary else None}
 
