@@ -889,10 +889,10 @@ def handler(job: dict) -> dict:
         _send_progress(job, "collecting", "Collecting outputs", percent=90)
         jlog.info(f"History outputs: {json.dumps({k: list(v.keys()) for k, v in history.get('outputs', {}).items()})}")
         results = comfy_client.collect_outputs(history, output_dir)
-        jlog.info(f"Collected: {len(results['images'])} images, {len(results['videos'])} videos")
+        jlog.info(f"Collected: {len(results['images'])} images, {len(results['videos'])} videos, {len(results['audio'])} audio")
 
         # --- Check for empty outputs / partial execution ---
-        if not results["images"] and not results["videos"]:
+        if not results["images"] and not results["videos"] and not results["audio"]:
             # Dump full history for debugging
             status = history.get("status", {})
             status_messages = status.get("messages", [])
@@ -921,7 +921,7 @@ def handler(job: dict) -> dict:
 
             # No explicit error but no outputs — partial execution or text-only output
             raise RuntimeError(
-                f"Workflow produced no image/video outputs. "
+                f"Workflow produced no image/video/audio outputs. "
                 f"History status: {json.dumps(status, indent=2)}"
             )
 
@@ -944,6 +944,13 @@ def handler(job: dict) -> dict:
             output_videos.append({"url": url, "size_bytes": vid["size_bytes"]})
             jlog.info(f"Uploaded video: {vid['filename']} ({vid['size_bytes']:,} bytes)")
 
+        output_audio = []
+        for aud in results["audio"]:
+            aud["size_bytes"] = os.path.getsize(aud["path"])
+            url = storage.upload(aud["path"])
+            output_audio.append({"url": url, "size_bytes": aud["size_bytes"]})
+            jlog.info(f"Uploaded audio: {aud['filename']} ({aud['size_bytes']:,} bytes)")
+
         # --- Wait for model hashes (should be done by now) ---
         hash_thread.join()
 
@@ -952,7 +959,7 @@ def handler(job: dict) -> dict:
         jlog.info(f"@@JOB_END {job_id}")
 
         # --- Build output in standard convention ---
-        # Primary output: prefer video, fall back to image
+        # Primary output: prefer video, fall back to image, then audio
         primary = None
         primary_path = None
         if output_videos:
@@ -961,6 +968,9 @@ def handler(job: dict) -> dict:
         elif output_images:
             primary = output_images[0]
             primary_path = results["images"][0]["path"]
+        elif output_audio:
+            primary = output_audio[0]
+            primary_path = results["audio"][0]["path"]
 
         output = {"url": primary["url"] if primary else None}
 

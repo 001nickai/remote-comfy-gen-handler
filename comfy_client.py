@@ -246,14 +246,16 @@ def _ws_poll_completion(
 def collect_outputs(history: dict, output_dir: str) -> dict:
     """Download all output files from a completed workflow.
 
-    Returns {"images": [...], "videos": [...]} with local file paths.
+    Returns {"images": [...], "videos": [...], "audio": [...]} with local file paths.
     """
     outputs = history.get("outputs", {})
     images = []
     videos = []
+    audio = []
 
     VIDEO_EXTS = (".mp4", ".webm", ".avi", ".mov", ".mkv", ".gif")
-    OUTPUT_KEYS = ("images", "gifs", "videos")
+    AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".opus")
+    OUTPUT_KEYS = ("images", "gifs", "videos", "audio")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -272,12 +274,14 @@ def collect_outputs(history: dict, output_dir: str) -> dict:
                 size = _download_output(fname, subfolder, ftype, local_path)
 
                 entry = {"path": local_path, "size_bytes": size, "filename": fname}
-                if any(fname.lower().endswith(ext) for ext in VIDEO_EXTS):
+                if any(fname.lower().endswith(ext) for ext in AUDIO_EXTS):
+                    audio.append(entry)
+                elif any(fname.lower().endswith(ext) for ext in VIDEO_EXTS):
                     videos.append(entry)
                 else:
                     images.append(entry)
 
-    return {"images": images, "videos": videos}
+    return {"images": images, "videos": videos, "audio": audio}
 
 
 def upload_input_file(local_path: str, filename: str) -> None:
