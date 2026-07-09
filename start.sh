@@ -14,6 +14,43 @@ RUNTIME_SUBJ="$(git -C "$RUNTIME_DIR" log -1 --pretty=%s 2>/dev/null || echo '?'
 echo "[start] runtime commit ${RUNTIME_SHA}: ${RUNTIME_SUBJ}"
 export RUNTIME_COMMIT="${RUNTIME_SHA}: ${RUNTIME_SUBJ}"
 
+# --- Failed-boot forensics ---
+# RunPod exposes worker logs only in the console UI; a boot crash under
+# `set -e` leaves no API-readable trace (burned 2026-07-08/09: qwen-tts ref
+# crash-loop). Mirror all boot output to a file and, ONLY if the script exits
+# non-zero, push it to R2 (boot-logs/ prefix). Healthy boots end in
+# `exec worker.py`, which never fires the EXIT trap. Best-effort: the trap
+# can never itself fail the boot.
+BOOT_LOG="/tmp/boot_trace.log"
+exec > >(tee -a "$BOOT_LOG") 2>&1
+boot_log_upload() {
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    python3 - "$BOOT_LOG" "$rc" <<'PYEOF' || true
+import os, sys, time
+try:
+    import boto3
+    body = open(sys.argv[1], "rb").read()
+    try:
+        body += b"\n===COMFY_LOG===\n" + open("/tmp/comfyui_startup.log", "rb").read()
+    except Exception:
+        pass
+    key = "boot-logs/%s-rc%s-%d.log" % (
+        os.environ.get("RUNPOD_POD_ID", "unknown"), sys.argv[2], int(time.time()))
+    boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL"),
+        region_name=os.environ.get("S3_REGION") or "auto",
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    ).put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=body)
+    print("[bootlog] uploaded %s" % key)
+except Exception as e:
+    print("[bootlog] upload failed: %r" % e)
+PYEOF
+}
+trap boot_log_upload EXIT
+
 echo "[start] Booting ComfyUI from $COMFYUI_DIR (baked in image)..."
 
 # Verify ComfyUI exists
